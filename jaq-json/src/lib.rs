@@ -940,19 +940,29 @@ fn float_cmp(left: f64, right: f64) -> Ordering {
 /// Format a string as valid JSON string, including leading and trailing quotes.
 pub fn fmt_str(f: &mut fmt::Formatter, s: &str) -> fmt::Result {
     write!(f, "\"")?;
-    for s in s.split_inclusive(|c| c < ' ' || c == '\\' || c == '"') {
+    for s in s.split_inclusive(|c| c < ' ' || c == '\\' || c == '"' || c == '\x7F') {
         // split s into last character and everything before (init)
         let mut chars = s.chars();
         let last = chars.next_back();
         let init = chars.as_str();
 
-        match last {
-            Some(last @ ('\t' | '\n' | '\r' | '\\' | '"')) => {
-                write!(f, "{init}{}", last.escape_default())
-            }
-            Some(last) if last < ' ' => write!(f, "{init}\\u{:04x}", last as u8),
-            _ => write!(f, "{s}"),
-        }?;
+        let escape_char = match last {
+            Some('\x08') => 'b',
+            Some('\t') => 't',
+            Some('\n') => 'n',
+            Some('\x0C') => 'f',
+            Some('\r') => 'r',
+            Some(last @ ('\\' | '\"')) => last,
+            Some(last) if last < ' ' || last == '\x7F' => {
+                write!(f, "{init}\\u{:04x}", last as u8)?;
+                continue;
+            },
+            _ => {
+                write!(f, "{s}")?;
+                continue;
+            },
+        };
+        write!(f, "{init}\\{}", escape_char)?;
     }
     write!(f, "\"")
 }
