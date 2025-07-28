@@ -637,6 +637,7 @@ impl<'s, 't> Parser<'s, 't> {
             }
             StrPart::Term(_) => unreachable!(),
             StrPart::Char(c) => StrPart::Char(*c),
+            StrPart::CodeUnit16(c) => StrPart::CodeUnit16(*c),
         });
         parts.collect()
     }

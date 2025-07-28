@@ -3,15 +3,22 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod json_string;
+
 extern crate alloc;
 
 use alloc::string::{String, ToString};
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
+use jaq_core::val::ValStrOps;
+use json_string::{JsonChar, JsonCharError, JsonCodeUnit};
 use core::cmp::Ordering;
+use core::convert::Infallible;
 use core::fmt::{self, Debug};
 use jaq_core::box_iter::{box_once, BoxIter};
 use jaq_core::{load, ops, path, Exn, Native, RunPtr};
 use jaq_std::{run, unary, v, Filter};
+
+pub use json_string::{JsonStr, JsonString};
 
 #[cfg(feature = "hifijson")]
 use hifijson::{LexAlloc, Token};
@@ -40,11 +47,11 @@ pub enum Val {
     /// Floating-point number or integer not fitting into `Int`
     Num(Rc<String>),
     /// String
-    Str(Rc<String>),
+    Str(Rc<JsonString>),
     /// Array
     Arr(Rc<Vec<Val>>),
     /// Object
-    Obj(Rc<Map<Rc<String>, Val>>),
+    Obj(Rc<Map<Rc<JsonString>, Val>>),
 }
 
 /// Types and sets of types.
@@ -98,8 +105,14 @@ fn rc_unwrap_or_clone<T: Clone>(a: Rc<T>) -> T {
 }
 
 impl jaq_core::ValT for Val {
+    type StrOps = JsonStringStrOps;
+
     fn from_num(n: &str) -> ValR {
         Ok(Val::Num(Rc::new(n.to_string())))
+    }
+
+    fn from_string(n: JsonString) -> ValR {
+        Ok(Val::Str(Rc::new(n)))
     }
 
     fn from_map<I: IntoIterator<Item = (Self, Self)>>(iter: I) -> ValR {
@@ -148,7 +161,7 @@ impl jaq_core::ValT for Val {
                     let from = abs_bound(from, len, 0);
                     let upto = abs_bound(upto, len, len);
                     let (skip, take) = skip_take(from, upto);
-                    Val::from(s.chars().skip(skip).take(take).collect::<String>())
+                    Val::from(s.chars().skip(skip).take(take).collect::<JsonString>())
                 })
             }
             _ => Err(Error::typ(self, Type::Range.as_str())),
@@ -262,7 +275,7 @@ impl jaq_core::ValT for Val {
     }
 
     /// If the value is a string, return it, else fail.
-    fn as_str(&self) -> Option<&str> {
+    fn as_str(&self) -> Option<&<Self::StrOps as ValStrOps>::ValStr> {
         if let Self::Str(s) = self {
             Some(s)
         } else {
@@ -270,6 +283,106 @@ impl jaq_core::ValT for Val {
         }
     }
 }
+
+pub struct JsonStringStrOps;
+
+impl ValStrOps for JsonStringStrOps {
+    type ValString = JsonString;
+    type ValStr = JsonStr;
+    type ValChar = JsonChar;
+
+    fn char_to_i32(c: Self::ValChar) -> i32 {
+        match c.to_char() {
+            Ok(c) => c as i32,
+            Err(JsonCharError(JsonCodeUnit::U8(u))) => -(u as i32),
+            Err(JsonCharError(JsonCodeUnit::U16(u))) => -(u as i32),
+        }
+    }
+
+    fn char_from_i32(c: i32) -> Option<Self::ValChar> {
+        match c {
+            c if c >= 0 => char::from_u32(c as u32).map(JsonChar::from_char),
+            c if c >= -0xFF && c <= -0x80 => Some(JsonChar::from_utf8_code_unit((-c) as u8)),
+            c if c >= -0xDFFF && c <= -0xD800 => Some(JsonChar::from_utf16_code_unit((-c) as u16)),
+            _ => None,
+        }
+    }
+
+    fn char_from_utf16(u: u16) -> Result<Self::ValChar, impl core::error::Error> {
+        Ok::<_, Infallible>(JsonChar::from_utf16_code_unit(u))
+    }
+
+    fn validate_str(val_str: &Self::ValStr) -> Result<&str, impl core::error::Error> {
+        val_str.maybe_utf8()
+    }
+
+    fn str_bytes(val_str: &Self::ValStr) -> impl Iterator<Item = Result<&[u8], impl core::error::Error>> {
+        val_str.iter_utf8()
+    }
+
+    fn str_chars<'a>(val_str: &'a Self::ValStr) -> impl Iterator<Item = Self::ValChar> + 'a {
+        val_str.chars()
+    }
+
+    fn from_bytes(data: &[u8]) -> Result<JsonString, impl core::error::Error> {
+        let mut s = JsonString::new();
+        s.push_utf8(data);
+        Ok::<_, Infallible>(s)
+    }
+
+    fn from_read<E>(read: &mut impl FnMut(&mut [u8]) -> Result<usize, E>) -> Result<Result<Self::ValString, impl core::error::Error>, E> {
+        let mut s = JsonString::new();
+        let mut buf = [0; 1024];
+        loop {
+            let size = read(&mut buf)?;
+            if size == 0 {
+                return Ok(Ok::<_, Infallible>(s));
+            }
+            s.push_utf8(&buf[..size]);
+        }
+    }
+
+    fn lines_from_read<E>(read: impl FnMut(&mut [u8]) -> Result<usize, E>) -> impl Iterator<Item = Result<Result<Self::ValString, impl core::error::Error>, E>> {
+        return I { read, buf: JsonString::new(), };
+        struct I<R> {
+            read: R,
+            buf: JsonString,
+        }
+        impl<E, R: FnMut(&mut [u8]) -> Result<usize, E>> Iterator for I<R> {
+            type Item = Result<Result<JsonString, Infallible>, E>;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                let mut buf = core::mem::replace(&mut self.buf, JsonString::new());
+                loop {
+                    let search_start = 0;
+                    // TODO: index_of or something?
+                    let mut chars = buf[search_start..].char_indices();
+                    if let Some((i, _)) = chars.find(|(_, c)| *c == JsonChar::from_char('\n')) {
+                        // TODO: why do I need this?
+                        drop(chars);
+                        self.buf.push_json_str(&buf[(search_start + i + 1)..]);
+                        buf.truncate(search_start + i);
+                        return Some(Ok(Ok(buf)));
+                    };
+                    // TODO: why do I need this?
+                    drop(chars);
+                    let read_size = match buf.read_utf8_into(1024, &mut self.read) {
+                        Ok(s) => s,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    if read_size == 0 {
+                        if buf.is_empty() {
+                            return None;
+                        } else {
+                            return Some(Ok(Ok(buf)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 impl jaq_std::ValT for Val {
     fn into_seq<S: FromIterator<Self>>(self) -> Result<S, Self> {
@@ -344,9 +457,9 @@ impl Val {
 /// Return the string windows having `n` characters, where `n` > 0.
 ///
 /// Taken from <https://users.rust-lang.org/t/iterator-over-windows-of-chars/17841/3>.
-fn str_windows(line: &str, n: usize) -> impl Iterator<Item = &str> {
+fn str_windows(line: &JsonStr, n: usize) -> impl Iterator<Item = &JsonStr> {
     line.char_indices()
-        .zip(line.char_indices().skip(n).chain(Some((line.len(), ' '))))
+        .zip(line.char_indices().skip(n).chain(Some((line.len(), ' '.into()))))
         .map(move |((i, _), (j, _))| &line[i..j])
 }
 
@@ -368,7 +481,7 @@ fn box_once_err<'a>(r: ValR) -> BoxIter<'a, ValX<'a>> {
 fn base() -> Box<[Filter<RunPtr<Val>>]> {
     Box::new([
         ("tojson", v(0), |_, cv| {
-            box_once(Ok(cv.1.to_string().into()))
+            box_once(Ok(cv.1.to_json_string().into()))
         }),
         ("length", v(0), |_, cv| box_once_err(cv.1.length())),
         ("path_values", v(0), |_, cv| {
@@ -406,12 +519,12 @@ fn base() -> Box<[Filter<RunPtr<Val>>]> {
 
 #[cfg(feature = "parse")]
 /// Convert string to a single JSON value.
-fn from_json(s: &str) -> ValR {
+fn from_json(s: &JsonStr) -> ValR {
     use hifijson::token::Lex;
-    let mut lexer = hifijson::SliceLexer::new(s.as_bytes());
+    let mut lexer = hifijson::IterLexer::new(s.iter_utf8_bytes());
     lexer
         .exactly_one(Val::parse)
-        .map_err(|e| Error::str(format_args!("cannot parse {s} as JSON: {e}")))
+        .map_err(|e| Error::str(format_args!("cannot parse {s:?} as JSON: {e}")))
 }
 
 #[cfg(feature = "parse")]
@@ -458,7 +571,7 @@ fn wrap_test() {
 
 impl Val {
     /// Construct an object value.
-    pub fn obj(m: Map<Rc<String>, Self>) -> Self {
+    pub fn obj(m: Map<Rc<JsonString>, Self>) -> Self {
         Self::Obj(m.into())
     }
 
@@ -484,7 +597,7 @@ impl Val {
     }
 
     /// If the value is a string, return it, else fail.
-    fn into_str(self) -> Result<Rc<String>, Error> {
+    fn into_str(self) -> Result<Rc<JsonString>, Error> {
         match self {
             Self::Str(s) => Ok(s),
             _ => Err(Error::typ(self, Type::Str.as_str())),
@@ -493,7 +606,7 @@ impl Val {
 
     #[cfg(feature = "parse")]
     /// If the value is a string, return it, else fail.
-    fn as_str(&self) -> Result<&Rc<String>, Error> {
+    fn as_str(&self) -> Result<&Rc<JsonString>, Error> {
         match self {
             Self::Str(s) => Ok(s),
             _ => Err(Error::typ(self.clone(), Type::Str.as_str())),
@@ -578,6 +691,21 @@ impl Val {
     #[cfg(feature = "hifijson")]
     pub fn parse(token: Token, lexer: &mut impl LexAlloc) -> Result<Self, hifijson::Error> {
         use hifijson::{token, Error};
+
+        fn str_json_string<E: From<hifijson::str::Error>>(lexer: &mut impl LexAlloc) -> Result<JsonString, E> {
+            lexer.str_fold::<E, JsonString>(
+                JsonString::new(),
+                |bytes, out| {
+                    out.push_utf8(bytes);
+                    Ok(())
+                },
+                |_, escape, out| {
+                    out.push_utf16(&[escape.as_u16()]);
+                    Ok(())
+                }
+            )
+        }
+
         match token {
             Token::Null => Ok(Self::Null),
             Token::True => Ok(Self::Bool(true)),
@@ -593,7 +721,7 @@ impl Val {
                 }
                 Ok(Self::Num(Rc::new(num.to_string())))
             }
-            Token::Quote => Ok(Self::from(lexer.str_string()?.to_string())),
+            Token::Quote => Ok(Self::from(str_json_string::<hifijson::Error>(lexer)?)),
             Token::LSquare => Ok(Self::Arr({
                 let mut arr = Vec::new();
                 lexer.seq(Token::RSquare, |token, lexer| {
@@ -606,11 +734,11 @@ impl Val {
                 let mut obj = Map::default();
                 lexer.seq(Token::RCurly, |token, lexer| {
                     let key =
-                        lexer.str_colon(token, |lexer| lexer.str_string().map_err(Error::Str))?;
+                        lexer.str_colon(token, |lexer| str_json_string(lexer).map_err(Error::Str))?;
 
                     let token = lexer.ws_token().ok_or(token::Expect::Value)?;
                     let value = Self::parse(token, lexer)?;
-                    obj.insert(Rc::new(key.to_string()), value);
+                    obj.insert(Rc::new(key), value);
                     Ok::<_, Error>(())
                 })?;
                 obj
@@ -633,7 +761,7 @@ impl From<serde_json::Value> for Val {
                 .map_or_else(|_| Self::Num(Rc::new(n.to_string())), Self::Int),
             String(s) => Self::from(s),
             Array(a) => a.into_iter().map(Self::from).collect(),
-            Object(o) => Self::obj(o.into_iter().map(|(k, v)| (Rc::new(k), v.into())).collect()),
+            Object(o) => Self::obj(o.into_iter().map(|(k, v)| (Rc::new(JsonString::from_string(k)), v.into())).collect()),
         }
     }
 }
@@ -649,11 +777,11 @@ impl From<Val> for serde_json::Value {
             Val::Int(i) => Number(i.into()),
             Val::Float(f) => serde_json::Number::from_f64(f).map_or(Null, Number),
             Val::Num(n) => Number(serde_json::Number::from_str(&n).unwrap()),
-            Val::Str(s) => String((*s).clone()),
+            Val::Str(s) => String((*s).clone().maybe_use_utf8().unwrap()), // mz TODO
             Val::Arr(a) => Array(a.iter().map(|x| x.clone().into()).collect()),
             Val::Obj(o) => Object(
                 o.iter()
-                    .map(|(k, v)| ((**k).clone(), v.clone().into()))
+                    .map(|(k, v)| ((**k).clone().maybe_use_utf8().unwrap(), v.clone().into())) // mz TODO
                     .collect(),
             ),
         }
@@ -678,8 +806,15 @@ impl From<f64> for Val {
     }
 }
 
+// TODO: try to remove this?
 impl From<String> for Val {
     fn from(s: String) -> Self {
+        JsonString::from_string(s).into()
+    }
+}
+
+impl From<JsonString> for Val {
+    fn from(s: JsonString) -> Self {
         Self::Str(Rc::new(s))
     }
 }
@@ -703,7 +838,7 @@ impl core::ops::Add for Val {
             (Num(n), r) => Self::from_dec_str(&n) + r,
             (l, Num(n)) => l + Self::from_dec_str(&n),
             (Str(mut l), Str(r)) => {
-                Rc::make_mut(&mut l).push_str(&r);
+                Rc::make_mut(&mut l).push_json_str(&r);
                 Ok(Str(l))
             }
             (Arr(mut l), Arr(r)) => {
@@ -741,7 +876,7 @@ impl core::ops::Sub for Val {
     }
 }
 
-fn obj_merge(l: &mut Rc<Map<Rc<String>, Val>>, r: Rc<Map<Rc<String>, Val>>) {
+fn obj_merge(l: &mut Rc<Map<Rc<JsonString>, Val>>, r: Rc<Map<Rc<JsonString>, Val>>) {
     let l = Rc::make_mut(l);
     let r = rc_unwrap_or_clone(r).into_iter();
     r.for_each(|(k, v)| match (l.get_mut(&k), v) {
@@ -777,16 +912,16 @@ impl core::ops::Mul for Val {
 }
 
 /// Split a string by a given separator string.
-fn split<'a>(s: &'a str, sep: &'a str) -> Box<dyn Iterator<Item = String> + 'a> {
+fn split<'a>(s: &'a JsonStr, sep: &'a JsonStr) -> Box<dyn Iterator<Item = JsonString> + 'a> {
     if s.is_empty() {
         Box::new(core::iter::empty())
     } else if sep.is_empty() {
         // Rust's `split` function with an empty separator ("")
         // yields an empty string as first and last result
         // to prevent this, we are using `chars` instead
-        Box::new(s.chars().map(|s| s.to_string()))
+        Box::new(s.chars().map(|s| JsonString::from_json_char(s)))
     } else {
-        Box::new(s.split(sep).map(|s| s.to_string()))
+        Box::new(s.split(sep).map(|s| s.to_json_string()))
     }
 }
 
@@ -937,14 +1072,36 @@ fn float_cmp(left: f64, right: f64) -> Ordering {
     }
 }
 
+pub trait BinaryFormatter: core::fmt::Write {
+    fn write_bin(&mut self, data: &[u8]) -> fmt::Result;
+}
+
+impl<'a> BinaryFormatter for fmt::Formatter<'a> {
+    fn write_bin(&mut self, data: &[u8]) -> fmt::Result {
+        panic!("Can't emit binary data {:?}", data)
+    }
+}
+
 /// Format a string as valid JSON string, including leading and trailing quotes.
-pub fn fmt_str(f: &mut fmt::Formatter, s: &str) -> fmt::Result {
+pub fn fmt_str(f: &mut impl BinaryFormatter, s: &JsonStr) -> fmt::Result {
+    fn write_non_special<'a>(f: &mut impl BinaryFormatter, s: &JsonStr) -> fmt::Result {
+        for data in s.iter_str() {
+            match data {
+                Ok(str) => f.write_str(str),
+                Err(JsonCharError(JsonCodeUnit::U8(error8))) => f.write_bin(&[error8]),
+                Err(JsonCharError(JsonCodeUnit::U16(error16))) => write!(f, "\\u{:04x}", error16),
+            }?
+        }
+        Ok(())
+    }
+
     write!(f, "\"")?;
     for s in s.split_inclusive(|c| c < ' ' || c == '\\' || c == '"' || c == '\x7F') {
         // split s into last character and everything before (init)
         let mut chars = s.chars();
-        let last = chars.next_back();
-        let init = chars.as_str();
+        let last = chars.next_back()
+            .and_then(|jc| jc.to_char().ok());
+        let init = chars.as_json_str();
 
         let escape_char = match last {
             Some('\x08') => 'b',
@@ -954,21 +1111,29 @@ pub fn fmt_str(f: &mut fmt::Formatter, s: &str) -> fmt::Result {
             Some('\r') => 'r',
             Some(last @ ('\\' | '\"')) => last,
             Some(last) if last < ' ' || last == '\x7F' => {
-                write!(f, "{init}\\u{:04x}", last as u8)?;
+                write_non_special(f, init)?;
+                write!(f, "\\u{:04x}", last as u8)?;
                 continue;
             },
             _ => {
-                write!(f, "{s}")?;
+                write_non_special(f, s)?;
                 continue;
             },
         };
-        write!(f, "{init}\\{}", escape_char)?;
+        write_non_special(f, init)?;
+        write!(f, "\\{}", escape_char)?;
     }
     write!(f, "\"")
 }
 
 impl fmt::Display for Val {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.binary_fmt(f)
+    }
+}
+
+impl Val {
+    pub fn binary_fmt(&self, f: &mut impl BinaryFormatter) -> fmt::Result {
         match self {
             Self::Null => write!(f, "null"),
             Self::Bool(b) => write!(f, "{b}"),
@@ -981,20 +1146,49 @@ impl fmt::Display for Val {
                 write!(f, "[")?;
                 let mut iter = a.iter();
                 if let Some(first) = iter.next() {
-                    write!(f, "{first}")?;
+                    first.binary_fmt(f)?
                 };
-                iter.try_for_each(|x| write!(f, ",{x}"))?;
+                iter.try_for_each(|x| {
+                    write!(f, ",")?;
+                    x.binary_fmt(f)
+                })?;
                 write!(f, "]")
             }
             Self::Obj(o) => {
                 write!(f, "{{")?;
                 let mut iter = o.iter().map(|(k, v)| (Val::Str(k.clone()), v));
                 if let Some((k, v)) = iter.next() {
-                    write!(f, "{k}:{v}")?;
+                    k.binary_fmt(f)?;
+                    write!(f, ":")?;
+                    v.binary_fmt(f)?;
                 }
-                iter.try_for_each(|(k, v)| write!(f, ",{k}:{v}"))?;
+                iter.try_for_each(|(k, v)| {
+                    write!(f, ",")?;
+                    k.binary_fmt(f)?;
+                    write!(f, ":")?;
+                    v.binary_fmt(f)
+                })?;
                 write!(f, "}}")
             }
         }
+    }
+
+    fn to_json_string(&self) -> JsonString {
+        struct Out(JsonString);
+        impl core::fmt::Write for Out {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                self.0.push_str(s);
+                Ok(())
+            }
+        }
+        impl BinaryFormatter for Out {
+            fn write_bin(&mut self, data: &[u8]) -> fmt::Result {
+                self.0.push_utf8(data);
+                Ok(())
+            }
+        }
+        let mut out = Out(JsonString::new());
+        self.binary_fmt(&mut out);
+        out.0
     }
 }

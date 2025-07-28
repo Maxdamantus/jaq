@@ -3,7 +3,7 @@
 use crate::box_iter::{self, box_once, flat_map_then, flat_map_then_with, flat_map_with, map_with};
 use crate::compile::{Bind, Fold, Lut, Pattern, Tailrec, Term as Ast, TermId as Id};
 use crate::fold::fold;
-use crate::val::{ValT, ValX, ValXs};
+use crate::val::{ValStrOps, ValT, ValX, ValXs};
 use crate::{exn, rc_lazy_list, Bind as Arg, Error, Exn, Inputs, RcList};
 use alloc::boxed::Box;
 use dyn_clone::DynClone;
@@ -341,6 +341,13 @@ impl<F: FilterT<F>> FilterT<F> for Id {
             Ast::Int(n) => box_once(Ok(Self::V::from(*n))),
             Ast::Num(x) => box_once(Self::V::from_num(x).map_err(Exn::from)),
             Ast::Str(s) => box_once(Ok(Self::V::from(s.clone()))),
+            Ast::CodeUnit16(u) => box_once({
+                // TODO: clean up this error handling?
+                let r_char = <<Self::V as ValT>::StrOps as ValStrOps>::char_from_utf16(*u)
+                    .map_err(|e| Exn::from(Error::str(e)));
+                let r_str = r_char.and_then(|c| Self::V::from_string([c].iter().copied().collect()).map_err(Exn::from));
+                r_str
+            }),
             Ast::Arr(f) => box_once(f.run(lut, cv).collect()),
             Ast::ObjEmpty => box_once(Self::V::from_map([]).map_err(Exn::from)),
             Ast::ObjSingle(k, v) => Box::new(
@@ -508,7 +515,7 @@ impl<F: FilterT<F>> FilterT<F> for Id {
         let err = box_once(Err(Exn::from(Error::path_expr())));
         match &lut.terms[self.0] {
             Ast::ToString => err,
-            Ast::Int(_) | Ast::Num(_) | Ast::Str(_) => err,
+            Ast::Int(_) | Ast::Num(_) | Ast::Str(_) | Ast::CodeUnit16(_) => err,
             Ast::Arr(_) | Ast::ObjEmpty | Ast::ObjSingle(..) => err,
             Ast::Neg(_) | Ast::Logic(..) | Ast::Math(..) | Ast::Cmp(..) => err,
             Ast::Update(..) | Ast::UpdateMath(..) | Ast::UpdateAlt(..) | Ast::Assign(..) => err,

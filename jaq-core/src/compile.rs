@@ -75,6 +75,7 @@ pub(crate) enum Term<T = TermId> {
     Int(isize),
     Num(String),
     Str(String),
+    CodeUnit16(u16),
     /// Array construction (`[f]`)
     Arr(T),
     /// Empty object (`{}`)
@@ -734,6 +735,7 @@ impl<'s, F> Compiler<&'s str, F> {
                 let parts = parts.into_iter().map(|part| match part {
                     StrPart::Str(s) => Term::Str(s.into()),
                     StrPart::Char(c) => Term::Str(c.into()),
+                    StrPart::CodeUnit16(c) => Term::CodeUnit16(c),
                     StrPart::Term(f) => Term::Pipe(self.iterm(f), None, fmt),
                 });
                 let parts = parts.collect();

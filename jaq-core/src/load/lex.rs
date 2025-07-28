@@ -17,6 +17,7 @@ pub enum StrPart<S, T> {
     Term(T),
     /// escaped character (e.g. `\n`, `t`, `\u0041`)
     Char(char),
+    CodeUnit16(u16),
 }
 
 /// Token (tree) generic over string type `S`.
@@ -243,7 +244,8 @@ impl<'a> Lexer<&'a str> {
                     }
                 }
                 match char::from_u32(hex) {
-                    None => return err_at(self, start_i),
+                    // TODO: try to read ahead in some cases and combine surrogates? unnecessary when using binary strings, but would improve handling of regular UTF-8 strings
+                    None => StrPart::CodeUnit16(u16::try_from(hex).unwrap()),
                     Some(c) => StrPart::Char(c),
                 }
             }

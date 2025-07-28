@@ -1,0 +1,24 @@
+# random binary data
+(. | @base64d | @base64) == .
+"zns0Su1i4JjDfGiR95WOcU8iiPMOrfJTUBm9P1ot2qIMiyk04b0WSIFNTMD7w9ziMV8nSbwpPqNl3JKF1eWZrRRg24rbvh66O1e7Z1xIGPNqTqm+jdzRCkWSryR+67wXRVgD6Q=="
+true
+
+# Check that unpaired surrogates are preserved in output
+"\u2200\ud800\u2203\udc00\u2205\udfff" | "\(.)\(explode | implode)"
+null
+"∀\ud800∃\udc00∅\udfff∀\ud800∃\udc00∅\udfff"
+
+# Check that unpaired surrogates are paired when concatenated
+add
+["\ud83d","\ude43","\ud83e","\udd11","\ud83e","\udd17","\ud83e","\udd14","\ud83e","\udd10","\ud83d","\ude44","\ud83e","\udd12","\ud83e","\udd15","\ud83e","\udd13","\ud83e","\udd16","\ud83e","\udd18","\ud83c","\udffb","\ud83c","\udffc"]
+"🙃🤑🤗🤔🤐🙄🤒🤕🤓🤖🤘🏻🏼"
+
+# test correction of UTF-8 errors when concatenating as binary data (input is a random sequence of code points)
+. as $text | @base64 | . as $b64 | [range(0, 300)] | map($b64[(.*4):((. + 1)*4)] | @base64d) | add | . == $text
+"\u884d\ud874\udf1e\udba7\udc1e\u3fb1\ua57d\udbcd\udda3\udbae\udcf8\udbd1\udc4f\u3ad1\udb90\udf76\udbc9\udf87\ud862\udec6\u001c\udb89\udd39\udbc2\udf94\u32ac\ud81c\udf3d\ud820\udc0d\udb93\udf39\udbf0\uddfa\udbb0\udc41\ud81d\udfd2\ud865\udd43\udbed\udee8\u52f8\udb96\udead\u9a0e\u1574\udbb8\udd07\ud86f\ude2c\u6900\ud86c\udfbe\udb84\udd83\udba2\udfa4\ud882\udcd2\udbc4\uded9\udbde\udc58\u1b8d\u76d5\u55ea\ud81e\udf1c\udbbb\udc52\udb9f\ude70\udbde\udc48\udbfe\udd69\ud861\udc6e\ud876\udc8a\udb9a\udc6e\udbbd\ude7e\u6c15\udbd9\udd2a\u3281"
+true
+
+# test preservation of binary data when concatenating (input is a random sequence of UTF-16 surrogates encoded in WTF-8, should be treated as regular UTF-8 errors)
+@base64d | . as $text | @base64 | . as $b64 | [range(0, 300)] | map($b64[(.*4):((. + 1)*4)] | @base64d) | add | . == $text
+"7bKv7aiz7auX7aG37aO77aOe7auy7bmm7bqk7aG87bSH7a6m7bmc7bum7bqj7au+7bqf7aap7buC7byq7aS37aCp7aSl7a+a7bur7aGV7bGl7b6M7biB7aOe7ayR7amW7aOX7b637a+P7bu+7ayP7bOw7ba/7ayp7b6G7aqd7bG37bK57b6O7bq27a+u7a2N7ayu7bKK"
+true

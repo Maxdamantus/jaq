@@ -5,12 +5,16 @@
 
 use crate::box_iter::BoxIter;
 use crate::path::Opt;
-use core::fmt::Display;
+use core::convert::Infallible;
+use core::fmt::{Debug, Display};
 use core::ops::{Add, Div, Mul, Neg, Rem, Sub};
 
 // Makes `f64::from_str` accessible as intra-doc link.
 #[cfg(doc)]
 use core::str::FromStr;
+use std::string::ToString;
+
+use alloc::string::String;
 
 /// Value or eRror.
 pub type ValR<V> = Result<V, crate::Error<V>>;
@@ -41,10 +45,14 @@ pub trait ValT:
     + Rem<Output = ValR<Self>>
     + Neg<Output = ValR<Self>>
 {
+    type StrOps: ValStrOps;
+
     /// Create a number from a string.
     ///
     /// The number should adhere to the format accepted by [`f64::from_str`].
     fn from_num(n: &str) -> ValR<Self>;
+
+    fn from_string(n: <Self::StrOps as ValStrOps>::ValString) -> ValR<Self>;
 
     /// Create an associative map (or object) from a sequence of key-value pairs.
     ///
@@ -113,10 +121,129 @@ pub trait ValT:
     /// This is used by `if v then ...`.
     fn as_bool(&self) -> bool;
 
-    /// If the value is a string, return it.
+    /// If the value is string, return it.
     ///
     /// If `v.as_str()` yields `Some(s)`, then
     /// `"\(v)"` yields `s`, otherwise it yields `v.to_string()`
     /// (provided by [`Display`]).
-    fn as_str(&self) -> Option<&str>;
+    fn as_str(&self) -> Option<&<Self::StrOps as ValStrOps>::ValStr>;
+}
+
+pub trait ValStrOps {
+    type ValString: Debug + From<String> + FromIterator<Self::ValChar>;
+    type ValStr: Debug + ?Sized;
+    type ValChar: Debug + Copy;
+
+    /// If the value is a valid UTF-8 string, return it.
+    fn validate_str(val_str: &Self::ValStr) -> Result<&str, impl core::error::Error>;
+
+    // TODO: jaq-std uses isize instead of i32 for some reason .. look into why this is?
+    fn char_to_i32(c: Self::ValChar) -> i32;
+
+    fn char_from_i32(c: i32) -> Option<Self::ValChar>;
+
+    fn char_from_utf16(u: u16) -> Result<Self::ValChar, impl core::error::Error>;
+
+    // mz TODO: docs
+    fn str_bytes(val_str: &Self::ValStr) -> impl Iterator<Item = Result<&[u8], impl core::error::Error>>;
+
+    // mz TODO: docs
+    fn str_chars<'a>(val_str: &'a Self::ValStr) -> impl Iterator<Item = Self::ValChar> + 'a;
+
+    // mz TODO: add default impl?
+    fn from_bytes(data: &[u8]) -> Result<Self::ValString, impl core::error::Error>;
+
+    // mz TODO: try to avoid Result<Result<..>>?
+    fn from_read<E>(read: &mut impl FnMut(&mut [u8]) -> Result<usize, E>) -> Result<Result<Self::ValString, impl core::error::Error>, E>;
+
+    // mz TODO: try to avoid Result<Result<..>>?
+    fn lines_from_read<E>(read: impl FnMut(&mut [u8]) -> Result<usize, E>) -> impl Iterator<Item = Result<Result<Self::ValString, impl core::error::Error>, E>>;
+}
+
+pub struct StrValStrOps;
+
+impl ValStrOps for StrValStrOps {
+    type ValString = String;
+    type ValStr = str;
+    type ValChar = char;
+
+    fn validate_str(val_str: &Self::ValStr) -> Result<&str, impl core::error::Error> {
+        Ok::<_, Infallible>(val_str)
+    }
+
+    fn char_to_i32(c: Self::ValChar) -> i32 {
+        c as i32
+    }
+
+    fn char_from_i32(c: i32) -> Option<Self::ValChar> {
+        char::from_u32(c as u32)
+    }
+
+    fn char_from_utf16(u: u16) -> Result<Self::ValChar, impl core::error::Error> {
+        char::try_from(u as u32)
+    }
+
+    fn str_bytes(val_str: &Self::ValStr) -> impl Iterator<Item = Result<&[u8], impl core::error::Error>> {
+        [val_str.as_bytes()].into_iter()
+            .map(|bytes| Ok::<_, Infallible>(bytes))
+    }
+
+    fn str_chars(val_str: &Self::ValStr) -> impl Iterator<Item = Self::ValChar> {
+        val_str.chars()
+    }
+
+    fn from_bytes(data: &[u8]) -> Result<Self::ValString, impl core::error::Error> {
+        String::from_utf8(data.into())
+    }
+
+    fn from_read<E>(mut read: &mut impl FnMut(&mut [u8]) -> Result<usize, E>) -> Result<Result<Self::ValString, impl core::error::Error>, E> {
+        let mut out = alloc::vec::Vec::new();
+        let mut buf = [0; 1024];
+        loop {
+            let size = read(&mut buf)?;
+            if size == 0 {
+                return Ok(String::from_utf8(out));
+            }
+            out.extend_from_slice(&buf[..size]);
+        }
+    }
+
+    fn lines_from_read<E>(read: impl FnMut(&mut [u8]) -> Result<usize, E>) -> impl Iterator<Item = Result<Result<Self::ValString, impl core::error::Error>, E>> {
+        return I { read, buf: alloc::vec::Vec::new(), };
+        struct I<R> {
+            read: R,
+            buf: alloc::vec::Vec<u8>,
+        }
+        impl<E, R: FnMut(&mut [u8]) -> Result<usize, E>> Iterator for I<R> {
+            type Item = Result<Result<String, std::string::FromUtf8Error>, E>;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                let mut buf = core::mem::take(&mut self.buf);
+                let mut search_start = 0;
+                loop {
+                    if let Some(i) = buf[search_start..].iter().position(|c| *c == b'\n') {
+                        self.buf.extend_from_slice(&buf[(search_start + i + 1)..]);
+                        buf.truncate(search_start + i);
+                        return Some(Ok(String::from_utf8(buf)));
+                    };
+                    let size = buf.len();
+                    buf.resize(size + 1024, 0);
+                    let tmp = &mut buf[size..];
+                    let read_size = match (self.read)(tmp) {
+                        Ok(s) => s,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    buf.truncate(size + read_size);
+                    if read_size == 0 {
+                        if buf.is_empty() {
+                            return None;
+                        } else {
+                            return Some(Ok(String::from_utf8(buf)));
+                        }
+                    }
+                    search_start = size;
+                }
+            }
+        }
+    }
 }

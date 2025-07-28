@@ -1,15 +1,19 @@
 mod cli;
 
 use cli::Cli;
+use jaq_core::val::ValStrOps;
 use core::fmt::{self, Display, Formatter};
+use std::rc::Rc;
 use is_terminal::IsTerminal;
 use jaq_core::{compile, load, Ctx, Native, RcIter, ValT};
-use jaq_json::Val;
+use jaq_json::{fmt_str, BinaryFormatter, JsonString, Val};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Termination};
 
 type Filter = jaq_core::Filter<Native<Val>>;
+//type StrOps = jaq_core::val::StrValStrOps;
+type StrOps = jaq_json::JsonStringStrOps;
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -133,7 +137,7 @@ fn real_main(cli: &Cli) -> Result<ExitCode, Error> {
 fn binds(cli: &Cli) -> Result<Vec<(String, Val)>, Error> {
     let arg = cli.arg.iter().map(|(k, s)| {
         let s = s.to_owned();
-        Ok((k.to_owned(), Val::Str(s.into())))
+        Ok((k.to_owned(), Val::Str(Rc::new(s.into()))))
     });
     let argjson = cli.argjson.iter().map(|(k, s)| {
         use hifijson::token::Lex;
@@ -142,8 +146,8 @@ fn binds(cli: &Cli) -> Result<Vec<(String, Val)>, Error> {
         Ok((k.to_owned(), lexer.exactly_one(Val::parse).map_err(err)?))
     });
     let rawfile = cli.rawfile.iter().map(|(k, path)| {
-        let s = std::fs::read_to_string(path).map_err(|e| Error::Io(Some(format!("{path:?}")), e));
-        Ok((k.to_owned(), Val::Str(s?.into())))
+        let s: &[u8] = &load_file(path).map_err(|e| Error::Io(Some(format!("{path:?}")), e))?;
+        Ok((k.to_owned(), Val::Str(Rc::new(s.into()))))
     });
     let slurpfile = cli.slurpfile.iter().map(|(k, path)| {
         let a = json_array(path).map_err(|e| Error::Io(Some(format!("{path:?}")), e));
@@ -157,14 +161,14 @@ fn binds(cli: &Cli) -> Result<Vec<(String, Val)>, Error> {
     let mut var_val = var_val.collect::<Result<Vec<_>, Error>>()?;
 
     var_val.push(("ARGS".to_string(), args(&positional, &var_val)));
-    let env = std::env::vars().map(|(k, v)| (k.into(), Val::from(v)));
+    let env = std::env::vars().map(|(k, v)| (Rc::new(k.into()), Val::from(v)));
     var_val.push(("ENV".to_string(), Val::obj(env.collect())));
 
     Ok(var_val)
 }
 
 fn args(positional: &[Val], named: &[(String, Val)]) -> Val {
-    let key = |k: &str| k.to_string().into();
+    let key = |k: &str| Rc::new(k.to_string().into());
     let positional = positional.iter().cloned();
     let named = named.iter().map(|(var, val)| (key(var), val.clone()));
     let obj = [
@@ -288,16 +292,19 @@ fn read_slice<'a>(cli: &Cli, slice: &'a [u8]) -> Box<dyn Iterator<Item = io::Res
     }
 }
 
-fn raw_input<'a, R>(slurp: bool, mut read: R) -> impl Iterator<Item = io::Result<String>> + 'a
+fn raw_input<'a, R>(slurp: bool, mut read: R) -> impl Iterator<Item = io::Result<<StrOps as ValStrOps>::ValString>> + 'a
 where
     R: BufRead + 'a,
 {
     if slurp {
-        let mut buf = String::new();
-        let s = read.read_to_string(&mut buf).map(|_| buf);
+        let s = StrOps::from_read(&mut |buf| read.read(buf))
+            .and_then(|s| s.map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string())));
         Box::new(std::iter::once(s))
     } else {
-        Box::new(read.lines()) as Box<dyn Iterator<Item = _>>
+        Box::new(
+            StrOps::lines_from_read(move |buf| read.read(buf))
+                .map(|r| r.and_then(|r| r.map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))))
+        ) as Box<dyn Iterator<Item = _>>
     }
 }
 
@@ -422,14 +429,14 @@ struct PpOpts {
 }
 
 impl PpOpts {
-    fn indent(&self, f: &mut Formatter, level: usize) -> fmt::Result {
+    fn indent(&self, f: &mut impl BinaryFormatter, level: usize) -> fmt::Result {
         if !self.compact {
             write!(f, "{}", self.indent.repeat(level))?;
         }
         Ok(())
     }
 
-    fn newline(&self, f: &mut Formatter) -> fmt::Result {
+    fn newline(&self, f: &mut impl BinaryFormatter) -> fmt::Result {
         if !self.compact {
             writeln!(f)?;
         }
@@ -437,10 +444,11 @@ impl PpOpts {
     }
 }
 
-fn fmt_seq<T, I, F>(fmt: &mut Formatter, opts: &PpOpts, level: usize, xs: I, f: F) -> fmt::Result
+fn fmt_seq<'a, T, I, BF, F>(fmt: &mut BF, opts: &PpOpts, level: usize, xs: I, f: F) -> fmt::Result
 where
     I: IntoIterator<Item = T>,
-    F: Fn(&mut Formatter, T) -> fmt::Result,
+    BF: BinaryFormatter,
+    F: Fn(&mut BF, T) -> fmt::Result,
 {
     opts.newline(fmt)?;
     let mut iter = xs.into_iter().peekable();
@@ -455,22 +463,57 @@ where
     opts.indent(fmt, level)
 }
 
-fn fmt_val(f: &mut Formatter, opts: &PpOpts, level: usize, v: &Val) -> fmt::Result {
+trait BinaryDisplay {
+    fn binary_fmt(&self, f: &mut impl BinaryFormatter) -> fmt::Result;
+}
+
+fn binary_fmt_styled<T, F: BinaryFormatter>(f: &mut F, painted: &yansi::Painted<T>, func: impl Fn(&mut F, &T) -> fmt::Result) -> fmt::Result {
+        if !yansi::is_enabled() {
+            return func(f, &painted.value);
+        }
+        painted.style.fmt_prefix(f)?;
+        func(f, &painted.value)?;
+        painted.style.fmt_suffix(f)
+}
+
+impl<T: BinaryDisplay> BinaryDisplay for yansi::Painted<T> {
+    fn binary_fmt(&self, f: &mut impl BinaryFormatter) -> fmt::Result {
+        binary_fmt_styled(f, self, |f, v| v.binary_fmt(f))
+    }
+}
+
+impl BinaryDisplay for &char {
+    fn binary_fmt(&self, f: &mut impl BinaryFormatter) -> fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
+impl BinaryDisplay for &Val {
+    fn binary_fmt(&self, f: &mut impl BinaryFormatter) -> fmt::Result {
+        fmt_val(f, &PpOpts { compact: false, indent: String::new(), sort_keys: false }, 0, self)
+    }
+}
+
+fn fmt_val<F: BinaryFormatter>(f: &mut F, opts: &PpOpts, level: usize, v: &Val) -> fmt::Result {
     use yansi::Paint;
     match v {
-        Val::Null | Val::Bool(_) | Val::Int(_) | Val::Float(_) | Val::Num(_) => v.fmt(f),
-        Val::Str(_) => write!(f, "{}", v.green()),
+        Val::Null | Val::Bool(_) | Val::Int(_) | Val::Float(_) | Val::Num(_) => v.binary_fmt(f),
+        Val::Str(s) => {
+            // maxz TODO: rethink this
+            binary_fmt_styled(f, &s.green(), |f, s| fmt_str(f, s))
+        },
         Val::Arr(a) => {
-            '['.bold().fmt(f)?;
+            '['.bold().binary_fmt(f)?;
             if !a.is_empty() {
                 fmt_seq(f, opts, level, &**a, |f, x| fmt_val(f, opts, level + 1, x))?;
             }
-            ']'.bold().fmt(f)
+            ']'.bold().binary_fmt(f)
         }
         Val::Obj(o) => {
-            '{'.bold().fmt(f)?;
-            let kv = |f: &mut Formatter, (k, val): (&std::rc::Rc<String>, &Val)| {
-                write!(f, "{}:", Val::Str(k.clone()).bold())?;
+            '{'.bold().binary_fmt(f)?;
+            let kv = |f: &mut F, (k, val): (&std::rc::Rc<JsonString>, &Val)| {
+                Val::Str(k.clone()).bold().binary_fmt(f)?;
+                write!(f, ":")?;
                 if !opts.compact {
                     write!(f, " ")?;
                 }
@@ -485,13 +528,35 @@ fn fmt_val(f: &mut Formatter, opts: &PpOpts, level: usize, v: &Val) -> fmt::Resu
                     fmt_seq(f, opts, level, &**o, kv)
                 }?
             }
-            '}'.bold().fmt(f)
+            '}'.bold().binary_fmt(f)
         }
     }
 }
 
-fn print(w: &mut (impl Write + ?Sized), cli: &Cli, val: &Val) -> io::Result<()> {
-    let f = |f: &mut Formatter| {
+fn print<W: Write + ?Sized>(w: &mut W, cli: &Cli, val: &Val) -> io::Result<()> {
+    struct BinFmt<A>(A);
+    impl<W: Write + ?Sized> BinaryFormatter for BinFmt<&mut W> {
+        fn write_bin(&mut self, data: &[u8]) -> fmt::Result {
+            // TODO: return Err instead of `unwrap`?
+            unsafe { &mut *self.0 }.write(data).unwrap();
+            Ok(())
+        }
+    }
+    impl<W: Write + ?Sized> core::fmt::Write for BinFmt<&mut W> {
+        fn write_str(&mut self, data: &str) -> fmt::Result {
+            // TODO: return Err instead of `unwrap`?
+            self.0.write_all(data.as_bytes()).unwrap();
+            Ok(())
+        }
+
+        fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
+            // TODO: return Err instead of `unwrap`?
+            self.0.write_fmt(args).unwrap();
+            Ok(())
+        }
+    }
+
+    let f = |w: &mut W| {
         let opts = PpOpts {
             compact: cli.compact_output,
             indent: if cli.tab {
@@ -501,12 +566,17 @@ fn print(w: &mut (impl Write + ?Sized), cli: &Cli, val: &Val) -> io::Result<()> 
             },
             sort_keys: cli.sort_keys,
         };
-        fmt_val(f, &opts, 0, val)
+        fmt_val(&mut BinFmt(w), &opts, 0, val)
     };
 
     match val {
-        Val::Str(s) if cli.raw_output || cli.join_output => write!(w, "{s}")?,
-        _ => write!(w, "{}", FormatterFn(f))?,
+        Val::Str(s) if cli.raw_output || cli.join_output => {
+            for bytes in s.iter_utf8() {
+                // mz TODO
+                w.write(bytes.unwrap())?;
+            }
+        },
+        _ => f(w).unwrap(),
     };
 
     if cli.join_output {
