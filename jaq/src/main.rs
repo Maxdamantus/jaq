@@ -538,7 +538,7 @@ fn print<W: Write + ?Sized>(w: &mut W, cli: &Cli, val: &Val) -> io::Result<()> {
     impl<W: Write + ?Sized> BinaryFormatter for BinFmt<&mut W> {
         fn write_bin(&mut self, data: &[u8]) -> fmt::Result {
             // TODO: return Err instead of `unwrap`?
-            unsafe { &mut *self.0 }.write(data).unwrap();
+            self.0.write_all(data).unwrap();
             Ok(())
         }
     }
@@ -573,7 +573,7 @@ fn print<W: Write + ?Sized>(w: &mut W, cli: &Cli, val: &Val) -> io::Result<()> {
         Val::Str(s) if cli.raw_output || cli.join_output => {
             for bytes in s.iter_utf8() {
                 // mz TODO
-                w.write(bytes.unwrap())?;
+                w.write_all(bytes.unwrap())?;
             }
         },
         _ => f(w).unwrap(),
