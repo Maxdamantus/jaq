@@ -14,6 +14,7 @@ rust-version = "1.65"
 [features]
 default = ["parse"]
 parse = ["hifijson"]
+mustring = []
 
 [dependencies]
 jaq-core = { version = "2.1.0", path = "../jaq-core" }

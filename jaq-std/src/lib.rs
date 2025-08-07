@@ -27,7 +27,7 @@ mod time;
 use alloc::string::{String, ToString};
 use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
 use jaq_core::box_iter::{box_once, then, BoxIter};
-use jaq_core::val::ValStrOps;
+use jaq_core::val::{ValChar, ValStr, ValStrOps, ValStrOpsT, ValString};
 use jaq_core::{load, Bind, Cv, Error, Exn, FilterT, Native, RunPtr, UpdatePtr, ValR, ValX, ValXs};
 
 /// Definitions of the standard library.
@@ -109,14 +109,14 @@ trait ValTx: ValT + Sized {
         self.into_seq().map_err(|v| Error::typ(v, "array"))
     }
 
-    fn try_as_val_str(&self) -> Result<&<Self::StrOps as ValStrOps>::ValStr, Error<Self>> {
+    fn try_as_val_str(&self) -> Result<&ValStr<Self>, Error<Self>> {
         self.as_str()
             .ok_or_else(|| Error::typ(self.clone(), "string"))
     }
 
     fn try_as_str(&self) -> Result<&str, Error<Self>> {
         self.try_as_val_str()
-            .and_then(|val_str| Self::StrOps::validate_str(val_str).map_err(Error::str))
+            .and_then(|val_str| <ValStrOps<Self>>::validate_str(val_str).map_err(Error::str))
     }
 
     fn try_as_isize(&self) -> Result<isize, Error<Self>> {
@@ -254,26 +254,26 @@ where
 }
 
 /// Convert a string into an array of its Unicode codepoints.
-fn explode<V: ValT>(s: &<V::StrOps as ValStrOps>::ValStr) -> impl Iterator<Item = ValR<V>> + '_ {
+fn explode<V: ValT>(s: &ValStr<V>) -> impl Iterator<Item = ValR<V>> + '_ {
     // conversion from u32 to isize may fail on 32-bit systems for high values of c
-    let conv = |c: <V::StrOps as ValStrOps>::ValChar| {
-        Ok(isize::try_from(V::StrOps::char_to_i32(c)).map_err(Error::str)?.into())
+    let conv = |c: ValChar<V>| {
+        Ok(isize::try_from(V::ValStrOps::char_to_i32(c)).map_err(Error::str)?.into())
     };
-    V::StrOps::str_chars(s).map(conv)
+    V::ValStrOps::str_chars(s).map(conv)
 }
 
 /// Convert an array of Unicode codepoints into a string.
-fn implode<V: ValT>(xs: &[V]) -> Result<<V::StrOps as ValStrOps>::ValString, Error<V>> {
+fn implode<V: ValT>(xs: &[V]) -> Result<ValString<V>, Error<V>> {
     xs.iter().map(as_codepoint).collect()
 }
 
 /// If the value is an integer representing a valid Unicode codepoint, return it, else fail.
-fn as_codepoint<V: ValT>(v: &V) -> Result<<V::StrOps as ValStrOps>::ValChar, Error<V>> {
+fn as_codepoint<V: ValT>(v: &V) -> Result<ValChar<V>, Error<V>> {
     let i = v.try_as_isize()? as i32;
     // conversion from isize to u32 may fail on 64-bit systems for high values of c
     //let u = u32::try_from(i).map_err(Error::str)?;
     // may fail e.g. on `[1114112] | implode`
-    V::StrOps::char_from_i32(i).ok_or_else(|| Error::str(format_args!("cannot use {i} as character")))
+    V::ValStrOps::char_from_i32(i).ok_or_else(|| Error::str(format_args!("cannot use {i} as character")))
 }
 
 /// This implements a ~10x faster version of:
@@ -339,7 +339,7 @@ fn base_run<V: ValT, F: FilterT<V = V>>() -> Box<[Filter<RunPtr<V, F>>]> {
         ("utf8bytelength", v(0), |_, cv| {
             bome(cv.1.try_as_val_str().and_then(|s| {
                 let mut sum = 0;
-                for bytes in V::StrOps::str_bytes(s) {
+                for bytes in V::ValStrOps::str_bytes(s) {
                     sum += bytes.map_err(Error::str)?.len();
                 }
                 Ok((sum as isize).into())
@@ -461,7 +461,7 @@ fn std<V: ValT>() -> Box<[Filter<RunPtr<V>>]> {
         ("halt_error", v(1), |_, mut cv| {
             bome(cv.0.pop_var().try_as_isize().map(|exit_code| {
                 if let Some(s) = cv.1.as_str() {
-                    if let Ok(valid_s) = V::StrOps::validate_str(s) {
+                    if let Ok(valid_s) = V::ValStrOps::validate_str(s) {
                         std::print!("{}", valid_s);
                     } else {
                         std::println!("{:?}", s);
@@ -512,7 +512,7 @@ fn format<V: ValT>() -> Box<[Filter<RunPtr<V>>]> {
                 // encoding slices with length divisible by 3, so that encodings can be concatenated
                 let mut buffer = [0; 3];
                 let mut buf_size = 0;
-                for data in V::StrOps::str_bytes(s) {
+                for data in V::ValStrOps::str_bytes(s) {
                     let mut data: &[u8] = data.map_err(Error::str)?;
                     while !data.is_empty() && buf_size > 0 && buf_size < buffer.len() {
                         buffer[buf_size] = data[0];
@@ -537,7 +537,7 @@ fn format<V: ValT>() -> Box<[Filter<RunPtr<V>>]> {
             use base64::{engine::general_purpose::STANDARD, Engine};
             bome(cv.1.try_as_str().and_then(|s| {
                 let d = STANDARD.decode(s).map_err(Error::str)?;
-                let os = V::StrOps::from_bytes(&d).map_err(Error::str)?;
+                let os = V::ValStrOps::from_bytes(&d).map_err(Error::str)?;
                 V::from_string(os)
             }))
         }),
@@ -698,7 +698,7 @@ fn debug<V: core::fmt::Display>() -> Filter<(RunPtr<V>, UpdatePtr<V>)> {
 fn stderr<V: ValT>() -> Filter<(RunPtr<V>, UpdatePtr<V>)> {
     fn eprint_raw<V: ValT>(v: &V) {
         if let Some(s) = v.as_str() {
-            if let Ok(valid_s) = V::StrOps::validate_str(s) {
+            if let Ok(valid_s) = V::ValStrOps::validate_str(s) {
                 log::error!("{}", valid_s)
             } else {
                 log::error!("{:?}", s)

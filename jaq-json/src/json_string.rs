@@ -16,7 +16,7 @@ pub enum JsonCodeUnit {
     U16(u16),
 }
 
-#[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct JsonString {
     content: Vec<u8>,
 }
@@ -86,6 +86,12 @@ impl From<&[u8]> for JsonString {
 impl From<&str> for JsonString {
     fn from(value: &str) -> Self {
         JsonString::from_string(value.into())
+    }
+}
+
+impl From<&JsonStr> for JsonString {
+    fn from(value: &JsonStr) -> Self {
+        value.to_json_string()
     }
 }
 
@@ -447,6 +453,7 @@ impl JsonStr {
         //JsonString::from_string(self.content.repeat(n))
     }
 
+    // TODO: use `From` instead
     pub fn to_json_string(&self) -> JsonString {
         JsonString { content: self.content.to_vec() }
     }
@@ -697,9 +704,9 @@ impl DoubleEndedIterator for JsonChars<'_> {
     }
 }
 
-impl JsonChars<'_> {
+impl<'a> JsonChars<'a> {
     // TODO: rename `as_json_str`?
-    pub fn as_json_str(&self) -> &JsonStr {
+    pub fn as_json_str(&self) -> &'a JsonStr {
         self.content
     }
 }

@@ -3,7 +3,7 @@
 use crate::box_iter::{self, box_once, flat_map_then, flat_map_then_with, flat_map_with, map_with};
 use crate::compile::{Bind, Fold, Lut, Pattern, Tailrec, Term as Ast, TermId as Id};
 use crate::fold::fold;
-use crate::val::{ValStrOps, ValT, ValX, ValXs};
+use crate::val::{ValStrOps, ValStrOpsT, ValT, ValX, ValXs};
 use crate::{exn, rc_lazy_list, Bind as Arg, Error, Exn, Inputs, RcList};
 use alloc::boxed::Box;
 use dyn_clone::DynClone;
@@ -343,7 +343,7 @@ impl<F: FilterT<F>> FilterT<F> for Id {
             Ast::Str(s) => box_once(Ok(Self::V::from(s.clone()))),
             Ast::CodeUnit16(u) => box_once({
                 // TODO: clean up this error handling?
-                let r_char = <<Self::V as ValT>::StrOps as ValStrOps>::char_from_utf16(*u)
+                let r_char = <ValStrOps<Self::V>>::char_from_utf16(*u)
                     .map_err(|e| Exn::from(Error::str(e)));
                 let r_str = r_char.and_then(|c| Self::V::from_string([c].iter().copied().collect()).map_err(Exn::from));
                 r_str

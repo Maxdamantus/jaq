@@ -26,6 +26,11 @@ pub type ValXs<'a, V> = BoxIter<'a, ValX<'a, V>>;
 /// Range of options, used for iteration operations.
 pub type Range<V> = core::ops::Range<Option<V>>;
 
+pub type ValStrOps<V: ValT> = V::ValStrOps;
+pub type ValString<V: ValT> = <V::ValStrOps as ValStrOpsT>::ValString;
+pub type ValStr<V: ValT> = <V::ValStrOps as ValStrOpsT>::ValStr;
+pub type ValChar<V: ValT> = <V::ValStrOps as ValStrOpsT>::ValChar;
+
 /// Values that can be processed by jaq.
 ///
 /// Implement this trait if you want jaq to process your own type of values.
@@ -45,14 +50,14 @@ pub trait ValT:
     + Rem<Output = ValR<Self>>
     + Neg<Output = ValR<Self>>
 {
-    type StrOps: ValStrOps;
+    type ValStrOps: ValStrOpsT;
 
     /// Create a number from a string.
     ///
     /// The number should adhere to the format accepted by [`f64::from_str`].
     fn from_num(n: &str) -> ValR<Self>;
 
-    fn from_string(n: <Self::StrOps as ValStrOps>::ValString) -> ValR<Self>;
+    fn from_string(n: ValString<Self>) -> ValR<Self>;
 
     /// Create an associative map (or object) from a sequence of key-value pairs.
     ///
@@ -126,16 +131,19 @@ pub trait ValT:
     /// If `v.as_str()` yields `Some(s)`, then
     /// `"\(v)"` yields `s`, otherwise it yields `v.to_string()`
     /// (provided by [`Display`]).
-    fn as_str(&self) -> Option<&<Self::StrOps as ValStrOps>::ValStr>;
+    fn as_str(&self) -> Option<&ValStr<Self>>;
 }
 
-pub trait ValStrOps {
-    type ValString: Debug + From<String> + FromIterator<Self::ValChar>;
+pub trait ValStrOpsT {
+    type ValString: Debug + From<String> + for<'a> From<&'a str> + FromIterator<Self::ValChar> + Default;
     type ValStr: Debug + ?Sized;
     type ValChar: Debug + Copy;
 
     /// If the value is a valid UTF-8 string, return it.
     fn validate_str(val_str: &Self::ValStr) -> Result<&str, impl core::error::Error>;
+
+    /// If the value is a valid UTF-8 string, return it.
+    fn validate_into_string(val_str: Self::ValString) -> Result<String, impl core::error::Error>;
 
     // TODO: jaq-std uses isize instead of i32 for some reason .. look into why this is?
     fn char_to_i32(c: Self::ValChar) -> i32;
@@ -145,10 +153,13 @@ pub trait ValStrOps {
     fn char_from_utf16(u: u16) -> Result<Self::ValChar, impl core::error::Error>;
 
     // mz TODO: docs
+    // TODO: rename str_utf8 ?
     fn str_bytes(val_str: &Self::ValStr) -> impl Iterator<Item = Result<&[u8], impl core::error::Error>>;
 
+    fn str_utf8_bytes(val_str: &Self::ValStr) -> impl Iterator<Item = Result<u8, impl core::error::Error>>;
+
     // mz TODO: docs
-    fn str_chars<'a>(val_str: &'a Self::ValStr) -> impl Iterator<Item = Self::ValChar> + 'a;
+    fn str_chars<'a>(val_str: &'a Self::ValStr) -> impl DoubleEndedIterator<Item = Self::ValChar> + 'a;
 
     // mz TODO: add default impl?
     fn from_bytes(data: &[u8]) -> Result<Self::ValString, impl core::error::Error>;
@@ -158,16 +169,28 @@ pub trait ValStrOps {
 
     // mz TODO: try to avoid Result<Result<..>>?
     fn lines_from_read<E>(read: impl FnMut(&mut [u8]) -> Result<usize, E>) -> impl Iterator<Item = Result<Result<Self::ValString, impl core::error::Error>, E>>;
+
+    fn push_val_str(out: &mut Self::ValString, data: &Self::ValStr) -> Result<(), impl core::error::Error>;
+
+    fn push_str(out: &mut Self::ValString, data: &str) -> Result<(), impl core::error::Error>;
+
+    fn push_utf8(out: &mut Self::ValString, data: &[u8]) -> Result<(), impl core::error::Error>;
+
+    fn push_utf16(out: &mut Self::ValString, data: &[u16]) -> Result<(), impl core::error::Error>;
 }
 
-pub struct StrValStrOps;
+pub struct StrStrOps;
 
-impl ValStrOps for StrValStrOps {
+impl ValStrOpsT for StrStrOps {
     type ValString = String;
     type ValStr = str;
     type ValChar = char;
 
     fn validate_str(val_str: &Self::ValStr) -> Result<&str, impl core::error::Error> {
+        Ok::<_, Infallible>(val_str)
+    }
+
+    fn validate_into_string(val_str: Self::ValString) -> Result<String, impl core::error::Error> {
         Ok::<_, Infallible>(val_str)
     }
 
@@ -183,12 +206,19 @@ impl ValStrOps for StrValStrOps {
         char::try_from(u as u32)
     }
 
+    // TODO: rename str_utf8 ?
     fn str_bytes(val_str: &Self::ValStr) -> impl Iterator<Item = Result<&[u8], impl core::error::Error>> {
         [val_str.as_bytes()].into_iter()
             .map(|bytes| Ok::<_, Infallible>(bytes))
     }
 
-    fn str_chars(val_str: &Self::ValStr) -> impl Iterator<Item = Self::ValChar> {
+    fn str_utf8_bytes(val_str: &Self::ValStr) -> impl Iterator<Item = Result<u8, impl core::error::Error>> {
+        val_str.as_bytes().into_iter()
+            .copied()
+            .map(|byte| Ok::<_, Infallible>(byte))
+    }
+
+    fn str_chars(val_str: &Self::ValStr) -> impl DoubleEndedIterator<Item = Self::ValChar> {
         val_str.chars()
     }
 
@@ -245,5 +275,33 @@ impl ValStrOps for StrValStrOps {
                 }
             }
         }
+    }
+
+    fn push_val_str(out: &mut Self::ValString, data: &str) -> Result<(), impl core::error::Error> {
+        Self::push_str(out, data)
+    }
+
+    fn push_str(out: &mut Self::ValString, data: &str) -> Result<(), impl core::error::Error> {
+        out.push_str(data);
+        Ok::<_, Infallible>(())
+    }
+
+    fn push_utf8(out: &mut Self::ValString, data: &[u8]) -> Result<(), impl core::error::Error> {
+        match core::str::from_utf8(data) {
+            Ok(s) => { out.push_str(s); Ok(()) },
+            Err(e) => Err(e),
+        }
+    }
+
+    fn push_utf16(out: &mut Self::ValString, data: &[u16]) -> Result<(), impl core::error::Error> {
+        let mut buf = [0; 4];
+        for c in core::char::decode_utf16(data.iter().copied()) {
+            let c = match c {
+                Ok(c) => c,
+                Err(e) => return Err(e),
+            };
+            out.push_str(c.encode_utf8(&mut buf));
+        }
+        Ok(())
     }
 }

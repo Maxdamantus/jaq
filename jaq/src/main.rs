@@ -1,19 +1,17 @@
 mod cli;
 
 use cli::Cli;
-use jaq_core::val::ValStrOps;
+use jaq_core::val::{ValStrOps, ValStrOpsT, ValString};
 use core::fmt::{self, Display, Formatter};
 use std::rc::Rc;
 use is_terminal::IsTerminal;
 use jaq_core::{compile, load, Ctx, Native, RcIter, ValT};
-use jaq_json::{fmt_str, BinaryFormatter, JsonString, Val};
+use jaq_json::{fmt_str, BinaryFormatter, Val};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Termination};
 
 type Filter = jaq_core::Filter<Native<Val>>;
-//type StrOps = jaq_core::val::StrValStrOps;
-type StrOps = jaq_json::JsonStringStrOps;
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -146,7 +144,10 @@ fn binds(cli: &Cli) -> Result<Vec<(String, Val)>, Error> {
         Ok((k.to_owned(), lexer.exactly_one(Val::parse).map_err(err)?))
     });
     let rawfile = cli.rawfile.iter().map(|(k, path)| {
-        let s: &[u8] = &load_file(path).map_err(|e| Error::Io(Some(format!("{path:?}")), e))?;
+        let b: &[u8] = &load_file(path).map_err(|e| Error::Io(Some(format!("{path:?}")), e))?;
+        let mut s = <ValString<Val>>::default();
+        // TODO: avoid to_string?
+        <ValStrOps<Val>>::push_utf8(&mut s, b).map_err(|e| Error::Io(Some(format!("{path:?}")), io::Error::new(io::ErrorKind::InvalidData, e.to_string())))?;
         Ok((k.to_owned(), Val::Str(Rc::new(s.into()))))
     });
     let slurpfile = cli.slurpfile.iter().map(|(k, path)| {
@@ -292,17 +293,17 @@ fn read_slice<'a>(cli: &Cli, slice: &'a [u8]) -> Box<dyn Iterator<Item = io::Res
     }
 }
 
-fn raw_input<'a, R>(slurp: bool, mut read: R) -> impl Iterator<Item = io::Result<<StrOps as ValStrOps>::ValString>> + 'a
+fn raw_input<'a, R>(slurp: bool, mut read: R) -> impl Iterator<Item = io::Result<ValString<Val>>> + 'a
 where
     R: BufRead + 'a,
 {
     if slurp {
-        let s = StrOps::from_read(&mut |buf| read.read(buf))
+        let s = <ValStrOps<Val>>::from_read(&mut |buf| read.read(buf))
             .and_then(|s| s.map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string())));
         Box::new(std::iter::once(s))
     } else {
         Box::new(
-            StrOps::lines_from_read(move |buf| read.read(buf))
+            <ValStrOps<Val>>::lines_from_read(move |buf| read.read(buf))
                 .map(|r| r.and_then(|r| r.map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))))
         ) as Box<dyn Iterator<Item = _>>
     }
@@ -511,7 +512,7 @@ fn fmt_val<F: BinaryFormatter>(f: &mut F, opts: &PpOpts, level: usize, v: &Val) 
         }
         Val::Obj(o) => {
             '{'.bold().binary_fmt(f)?;
-            let kv = |f: &mut F, (k, val): (&std::rc::Rc<JsonString>, &Val)| {
+            let kv = |f: &mut F, (k, val): (&std::rc::Rc<ValString<Val>>, &Val)| {
                 Val::Str(k.clone()).bold().binary_fmt(f)?;
                 write!(f, ":")?;
                 if !opts.compact {
@@ -571,7 +572,7 @@ fn print<W: Write + ?Sized>(w: &mut W, cli: &Cli, val: &Val) -> io::Result<()> {
 
     match val {
         Val::Str(s) if cli.raw_output || cli.join_output => {
-            for bytes in s.iter_utf8() {
+            for bytes in <ValStrOps<Val>>::str_bytes(s) {
                 // mz TODO
                 w.write_all(bytes.unwrap())?;
             }
