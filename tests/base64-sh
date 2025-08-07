@@ -11,6 +11,8 @@ if dd if=/dev/urandom bs=1024 count=1024 >$d/rand 2>/dev/null; then
     cmp $d/out $d/rand
     $VALGRIND $Q $JQ -jR fromjson $d/out.json >$d/out
     cmp $d/out $d/rand
+    $VALGRIND $Q $JQ -jR 'fromjson | tojson | fromjson' $d/out.json >$d/out
+    cmp $d/out $d/rand
     $VALGRIND $Q $JQ -j '@base64 | @base64d' $d/out.json >$d/out
     cmp $d/out $d/rand
     $VALGRIND $Q $JQ -j 'explode | implode' $d/out.json >$d/out
