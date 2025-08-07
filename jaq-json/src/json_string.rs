@@ -211,7 +211,7 @@ impl JsonString {
     }
 
     pub fn contains(&self, needle: impl Pattern) -> bool {
-        todo!()
+        needle.next_match(self).is_some()
     }
 
     pub fn push_json_str(&mut self, mut other: &JsonStr) {
@@ -381,15 +381,13 @@ impl JsonStr {
         core::str::from_utf8(&self.content)
     }
 
-    // TODO: consider using `Pattern` trait?
     pub fn split_inclusive(&self, pat: impl Pattern) -> impl Iterator<Item = &JsonStr> {
         self.split_inclusive_x(pat)
             .filter(|(item, pat_len, is_final)| !is_final || item.len() != 0) // mz TODO
             .map(|(s, _, _)| s)
     }
 
-    // TODO: consider using `Pattern` trait?
-    pub fn split<'a>(&'a self, pat: impl Pattern) -> impl Iterator<Item = &'a JsonStr> {
+    pub fn split(&self, pat: impl Pattern) -> impl Iterator<Item = &JsonStr> {
         self.split_inclusive_x(pat)
             .map(|(s, pat_len, _)| s.slice(0, s.len() - pat_len))
     }
@@ -404,7 +402,7 @@ impl JsonStr {
 
             fn next(&mut self) -> Option<Self::Item> {
                 let haystack = self.haystack?;
-                if let Some((start, end)) = P::next_match(haystack, &self.pat) {
+                if let Some((start, end)) = self.pat.next_match(haystack) {
                     let out = haystack.slice(0, end);
                     self.haystack = Some(haystack.slice(end, haystack.len()));
                     return Some((out, end - start, false));
@@ -449,8 +447,11 @@ impl JsonStr {
     }
 
     pub fn repeat(&self, n: usize) -> JsonString {
-        todo!()
-        //JsonString::from_string(self.content.repeat(n))
+        let mut out = JsonString::new();
+        for i in 0..n {
+            out.push_json_str(self);
+        }
+        out
     }
 
     // TODO: use `From` instead
@@ -555,16 +556,16 @@ impl JsonStr {
 
 // TODO: should this be more like the (currently experimental `str::Pattern`?)
 trait Pattern {
-    fn next_match(haystack: &JsonStr, needle: &Self) -> Option<(usize, usize)>;
+    fn next_match(&self, haystack: &JsonStr) -> Option<(usize, usize)>;
 }
 
 impl Pattern for &JsonStr {
-    fn next_match(haystack: &JsonStr, needle: &&JsonStr) -> Option<(usize, usize)> {
+    fn next_match(&self, haystack: &JsonStr) -> Option<(usize, usize)> {
         let mut haystack: &[u8] = &haystack.content;
         let mut n = 0;
-        while haystack.len() > needle.len() {
-            if haystack.starts_with(&needle.content) {
-                return Some((n, n + needle.len()));
+        while haystack.len() >= self.len() {
+            if haystack.starts_with(&self.content) {
+                return Some((n, n + self.len()));
             }
             n += 1;
             haystack = &haystack[1..];
@@ -574,19 +575,19 @@ impl Pattern for &JsonStr {
 }
 
 impl Pattern for &JsonString {
-    fn next_match(haystack: &JsonStr, needle: &Self) -> Option<(usize, usize)> {
-        Pattern::next_match(haystack, &needle.as_ref())
+    fn next_match(&self, haystack: &JsonStr) -> Option<(usize, usize)> {
+        self.as_ref().next_match(haystack)
     }
 }
 
 struct JsonCharPattern<T>(T);
 
 impl <T: Fn(JsonChar) -> bool> Pattern for JsonCharPattern<T> {
-    fn next_match(haystack: &JsonStr, needle: &JsonCharPattern<T>) -> Option<(usize, usize)> {
+    fn next_match(&self, haystack: &JsonStr) -> Option<(usize, usize)> {
         let mut iter = haystack.char_indices();
         loop {
             let (n, c) = iter.next()?;
-            if !needle.0(c) {
+            if !self.0(c) {
                 continue;
             }
             let end = match iter.next() {
@@ -599,11 +600,11 @@ impl <T: Fn(JsonChar) -> bool> Pattern for JsonCharPattern<T> {
 }
 
 impl <T: Fn(char) -> bool> Pattern for T {
-    fn next_match(haystack: &JsonStr, needle: &T) -> Option<(usize, usize)> {
-        Pattern::next_match(haystack, &JsonCharPattern(|jc: JsonChar| match jc.to_char() {
-            Ok(c) => needle(c),
+    fn next_match(&self, haystack: &JsonStr) -> Option<(usize, usize)> {
+        Pattern::next_match(&JsonCharPattern(|jc: JsonChar| match jc.to_char() {
+            Ok(c) => self(c),
             _ => false,
-        }))
+        }), haystack)
     }
 }
 
