@@ -154,9 +154,9 @@ pub trait ValStrOpsT {
 
     // mz TODO: docs
     // TODO: rename str_utf8 ?
-    fn str_bytes(val_str: &Self::ValStr) -> impl Iterator<Item = Result<&[u8], impl core::error::Error>>;
+    fn str_bytes(val_str: &Self::ValStr) -> impl Iterator<Item = Result<&[u8], impl core::error::Error>> + '_;
 
-    fn str_utf8_bytes(val_str: &Self::ValStr) -> impl Iterator<Item = Result<u8, impl core::error::Error>>;
+    fn str_utf8_bytes(val_str: &Self::ValStr) -> impl Iterator<Item = Result<u8, impl core::error::Error>> + '_;
 
     // mz TODO: docs
     fn str_chars<'a>(val_str: &'a Self::ValStr) -> impl DoubleEndedIterator<Item = Self::ValChar> + 'a;

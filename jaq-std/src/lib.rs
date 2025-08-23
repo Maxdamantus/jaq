@@ -276,6 +276,29 @@ fn as_codepoint<V: ValT>(v: &V) -> Result<ValChar<V>, Error<V>> {
     V::ValStrOps::char_from_i32(i).ok_or_else(|| Error::str(format_args!("cannot use {i} as character")))
 }
 
+/// If the value is an unsigned integer representing a byte (UTF-8 code unit), return it, else fail.
+fn as_byte<V: ValT>(v: &V) -> Result<u8, Error<V>> {
+    let i = v.try_as_isize()? as i32;
+    u8::try_from(i).map_err(Error::str)
+}
+
+/// Convert a string into an array of its UTF-8 code units.
+fn explode_bytes<V: ValT>(s: &ValStr<V>) -> impl Iterator<Item = ValR<V>> + '_ {
+    V::ValStrOps::str_utf8_bytes(s).map(|r_b| {
+        let b: u8 = r_b.map_err(Error::str)?;
+        Ok((b as isize).into())
+    })
+}
+
+/// Convert an array of UTF-8 code units into a string.
+fn implode_bytes<V: ValT>(xs: &[V]) -> Result<ValString<V>, Error<V>> {
+    let mut bytes = Vec::with_capacity(xs.len());
+    for b in xs.iter().map(as_byte) {
+        bytes.push(b?);
+    }
+    V::ValStrOps::from_bytes(&bytes).map_err(Error::str)
+}
+
 /// This implements a ~10x faster version of:
 /// ~~~ text
 /// def range($from; $to; $by): $from |
@@ -350,6 +373,12 @@ fn base_run<V: ValT, F: FilterT<V = V>>() -> Box<[Filter<RunPtr<V, F>>]> {
         }),
         ("implode", v(0), |_, cv| {
             bome(cv.1.into_vec().and_then(|s| implode(&s)).and_then(|s| V::from_string(s)))
+        }),
+        ("explode_bytes", v(0), |_, cv| {
+            bome(cv.1.try_as_val_str().and_then(|s| explode_bytes(s).collect()))
+        }),
+        ("implode_bytes", v(0), |_, cv| {
+            bome(cv.1.into_vec().and_then(|s| implode_bytes(&s)).and_then(|s| V::from_string(s)))
         }),
         ("ascii_downcase", v(0), |_, cv| {
             bome(cv.1.mutate_str(str::make_ascii_lowercase))
